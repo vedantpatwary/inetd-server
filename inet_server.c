@@ -16,9 +16,10 @@
 #include <sys/types.h>
 #include <sys/msg.h>
 #include <unistd.h>
-
+#include<sys/wait.h>
 #define MAX_LINE_LENGTH 200
 fd_set allset, rset;
+char *port_;
 
 struct inet{
 	char service[20];
@@ -29,22 +30,26 @@ struct inet{
 	char *execFile;
 	char *args[10];
 	int fd;
+	pid_t pid;
 	struct inet *next;
 };
 typedef struct inet inet_t;
+inet_t *head =NULL;
 
 inet_t * fillStructure(FILE * fp);
 int findInServices(char *name, char * protocol);
 inet_t* add_inet(inet_t *head,inet_t *new_inet);
 inet_t *findbyfd(inet_t *head,int fd);
+inet_t *findbypid(inet_t *head,int pid);
 inet_t *deletebyfd(inet_t *head,int fd);
 void createSocketAddFd(inet_t *inet);
 int execServer(inet_t * head, int ifd);
 void handler(int signo);
 
-int main() {
-	FILE * fp = fopen("/etc/inetd.conf", "r");
-	inet_t *head =NULL;
+int main(int argc, char *argv[]) {
+	signal(SIGCHLD, handler);
+	port_ = argv[1];
+	FILE * fp = fopen("/etc/inetd.conf", "rwait(NULL);");
 	int maxfd = 0;
 	if(fp == NULL) {
 		fp = fopen("inetd.conf", "r");
@@ -71,6 +76,7 @@ int main() {
 		int ready = -1;
 		do {
 			ready = select (maxfd + 1, &rset, NULL, NULL, NULL);
+			// printf("ready=%d\n",ready);
 		}
 		while(ready == -1 && errno == EINTR);
 		if(ready == -1) {
@@ -79,7 +85,7 @@ int main() {
 		}
 		for (int ifd = 0; ifd <= maxfd; ifd++) {
 			if (FD_ISSET (ifd, &rset)){
-				int isWait = execServer(head, ifd);
+				execServer(head, ifd);
 			}
 		}
 
@@ -99,6 +105,13 @@ inet_t* add_inet(inet_t *head,inet_t *new_inet){
 inet_t *findbyfd(inet_t *head,int fd){
 	inet_t *temp = head;
 	while(temp && temp->fd!=fd)
+		temp=temp->next;
+	return temp;
+}
+
+inet_t *findbypid(inet_t *head,int pid){
+	inet_t *temp = head;
+	while(temp && temp->pid!=pid)
 		temp=temp->next;
 	return temp;
 }
@@ -124,25 +137,25 @@ inet_t *deletebyfd(inet_t *head,int fd){
 inet_t * fillStructure(FILE * fp) {
 	inet_t * inet =(inet_t*)malloc(sizeof(struct inet));
 	fseek(fp, -1, SEEK_CUR);
-	char line[MAX_LINE_LENGTH];
+	char *line =(char*)malloc(sizeof(char)*MAX_LINE_LENGTH);
 	fscanf(fp, "%s %s %s %s %s %[^\n]\n",inet->service,inet->sockType,inet->protocol,inet->flags,inet->login,line);
-	printf("%s %s %s %s %s %s ",inet->service,inet->sockType,inet->protocol,inet->flags,inet->login,line);
+	// printf("%s %s %s %s %s %s ",inet->service,inet->sockType,inet->protocol,inet->flags,inet->login,line);
 	char delim[] = " \n";
 	inet->execFile = strtok(line, delim);
-	printf("exec = %s ", inet->execFile);
+	// printf("exec = %s ", inet->execFile);
 	int i=0;
 	inet->args[i] = strtok(NULL, delim);
 	while(inet->args[i] != NULL) {
-		printf("args[%d]:%s ", i, inet->args[i]);
+		// printf("args[%d]:%s ", i, inet->args[i]);
 		i++;
 		inet->args[i] = strtok(NULL, delim);
 	}
-	printf("\n");
+	// printf("\n");
 	return inet;
 }
 
 int findInServices(char *name, char * protocol) {
-	FILE * fpservices = fopen("/etc/services", "r");
+	FILE * fpservices = fopen("services", "r");
 	int port;
 	char name2[MAX_LINE_LENGTH], protocol2[MAX_LINE_LENGTH], line[MAX_LINE_LENGTH];
 	while(!feof(fpservices)) {
@@ -167,6 +180,7 @@ void createSocketAddFd(inet_t *inet){
 		bzero (&servaddr, sizeof (servaddr));
 		servaddr.sin_family = AF_INET;
 		servaddr.sin_addr.s_addr = htonl (INADDR_ANY);
+		// printf("port=%d\n",findInServices(inet->service, inet->protocol));
 		servaddr.sin_port = htons (findInServices(inet->service, inet->protocol));
 		int bindret = bind (lfd, (struct sockaddr *) &servaddr, sizeof (servaddr));
 		if (bindret < 0)
@@ -178,6 +192,14 @@ void createSocketAddFd(inet_t *inet){
 	}
 	else{
 		int sockfd = socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);
+		bzero (&servaddr, sizeof (servaddr));
+		servaddr.sin_family = AF_INET;
+		servaddr.sin_addr.s_addr = htonl (INADDR_ANY);
+		// printf("port=%d\n",findInServices(inet->service, inet->protocol));
+		servaddr.sin_port = htons (findInServices(inet->service, inet->protocol));
+		int bindret = bind (sockfd, (struct sockaddr *) &servaddr, sizeof (servaddr));
+		if (bindret < 0)
+			perror("bind");
 		inet->fd = sockfd;
 	}
 }
@@ -186,28 +208,46 @@ int execServer(inet_t * head, int ifd) {		// 1 return is WAIT
 	inet_t * inetstr = findbyfd(head, ifd);
 	struct sockaddr_in cli_addr;
 	int clilen;
+	// printf("inet->service=%s\n",inetstr->service);
 	if(strcmp(inetstr->protocol,"tcp")==0){						//TCP
 		int confd = accept(inetstr->fd,(struct sockaddr*)&cli_addr,&clilen);
-		if(fork()==0){		//child
+		if(confd<0){
+			perror("accept");
+		}
+		// printf("Forking in tcp\n");
+		pid_t childpid;
+		if((childpid = fork())==0){		//child
 			//close all fds except confd
+			// printf("inside child\n");
 			inet_t *temp = head;
 			while(temp!=NULL){
 				close(temp->fd);
 				temp=temp->next;
 			}
-			dup2(confd, 0);
-			dup2(confd, 1);
+			// printf("efile=%s, exargs=%s\n", inetstr->execFile, inetstr->args[0]);
+			int dupret = dup2(confd, 0);
+			if(dupret < 0)
+				perror("dup2");
+			dupret = dup2(confd, 1);
+			if(dupret < 0)
+				perror("dup2");
+			// printf("hello\n");
 			execv(inetstr->execFile, inetstr->args);
 			//exec
 		}
 		else{
 			close(confd);
-			if(strcmp(inetstr->flags,"wait")==0)
+			// inetstr->pid = childpid;
+			printf("New TCP client with Service:%s, process with pid=%d is executing %s\n", inetstr->service, childpid, inetstr->execFile);
+			if(strcmp(inetstr->flags,"wait")==0){
 				FD_CLR(inetstr->fd,&allset);
+				rset = allset;
+			}
 		}
 	}
 	else{	//udp
-		if(fork()==0){		//child
+		pid_t childpid;
+		if((childpid = fork())==0){		//child
 			//close all fds except confd
 			inet_t *temp = head;
 			while(temp!=NULL){
@@ -215,14 +255,26 @@ int execServer(inet_t * head, int ifd) {		// 1 return is WAIT
 					close(temp->fd);
 				temp=temp->next;
 			}
-			dup2(confd, 0);
-			dup2(confd, 1);
+			dup2(ifd, 0);
+			dup2(ifd, 1);
 			execv(inetstr->execFile, inetstr->args);
-			//exec
 		}
 		else{
-			if(strcmp(inetstr->flags,"wait")==0)
+			printf("New UDP client with Service:%s, process with pid=%d is executing %s\n", inetstr->service, childpid, inetstr->execFile);
+			inetstr->pid = childpid;
+			if(strcmp(inetstr->flags,"wait")==0){
 				FD_CLR(inetstr->fd,&allset);
+				rset = allset;
+			}
 		}
+	}
+}
+
+void handler(int signo) {
+	pid_t cpid = wait(NULL);
+	inet_t * inet = findbypid(head, cpid);
+	if(inet != NULL) {
+		FD_SET (inet->fd, &allset);
+		rset = allset;
 	}
 }

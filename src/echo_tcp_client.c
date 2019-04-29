@@ -76,7 +76,7 @@ int main(int argc, char *argv[])
 
 	    printf("\n");
 	}
-	printf("exited");
+	printf("exited\n");
     close(sock);
     exit(0);
 }
